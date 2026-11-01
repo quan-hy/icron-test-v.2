@@ -1163,6 +1163,8 @@ def main(argv: list[str] | None = None) -> int:
         tasks.append(("ecmwf", lambda: collect_ecmwf(spots, cycles["ecmwf"], steps)))
 
     runs: list[dict[str, object]] = []
+    # Start the shared model alongside NOAA, rather than after every region's queue.
+    tasks.sort(key=lambda task: task[0] != "ecmwf")
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = {executor.submit(task): source for source, task in tasks}
         for future in as_completed(futures):
