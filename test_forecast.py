@@ -742,6 +742,33 @@ class PublicSpotInputTests(unittest.TestCase):
         for secret in (username, password, token):
             self.assertNotIn(secret, stderr.getvalue())
 
+    def test_slow_nomads_response_does_not_block_another_paced_start(self):
+        first_started = threading.Event()
+        second_started = threading.Event()
+        starts = []
+        guard = threading.Lock()
+
+        def open_nomads(request, timeout):
+            with guard:
+                first = not starts
+                starts.append(request.full_url)
+            if first:
+                first_started.set()
+                if not second_started.wait(5):
+                    raise AssertionError("HTTP response wait serialized independent requests")
+            else:
+                second_started.set()
+            return io.BytesIO(b"GRIB")
+
+        with patch.object(forecast, "_nomads_next_start", 0.0), patch("forecast.urlopen", side_effect=open_nomads):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                first = executor.submit(forecast._download, f"{forecast.NOMADS}/first.grib2")
+                self.assertTrue(first_started.wait(5))
+                second = executor.submit(forecast._download, f"{forecast.NOMADS}/second.grib2")
+                self.assertEqual(first.result(timeout=6), b"GRIB")
+                self.assertEqual(second.result(timeout=6), b"GRIB")
+        self.assertEqual(len(starts), 2)
+
     def test_nomads_attempts_are_paced_across_threads_and_retries_only(self):
         class FakeClock:
             def __init__(self):

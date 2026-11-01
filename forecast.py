@@ -498,9 +498,8 @@ def _download(url: str) -> bytes:
                 time.sleep(delay)
             _nomads_next_start = time.monotonic() + NOMADS_MIN_INTERVAL
             _count_request("noaa")
-            response = urlopen(request, timeout=60)
-    else:
-        response = urlopen(request, timeout=60)
+    # Pace starts, but let the two bounded workers wait for responses independently.
+    response = urlopen(request, timeout=60)
     with response:
         payload = response.read(MAX_DOWNLOAD_BYTES + 1)
     if len(payload) > MAX_DOWNLOAD_BYTES:
@@ -1055,10 +1054,9 @@ def _index_exists(source: str, url: str) -> bool:
                     time.sleep(delay)
                 _nomads_next_start = time.monotonic() + NOMADS_MIN_INTERVAL
                 _count_request(source)
-                response = urlopen(request, timeout=60)
         else:
             _count_request(source)
-            response = urlopen(request, timeout=60)
+        response = urlopen(request, timeout=60)
         with response:
             return b""
     try:
