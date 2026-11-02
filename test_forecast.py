@@ -912,6 +912,13 @@ class ClusterAndCycleTests(unittest.TestCase):
             with self.assertRaises(SourceDataError):
                 forecast.select_cycle("ecmwf", now, 144)
 
+    def test_noaa_in_progress_cycle_403_is_not_ready(self):
+        # NOMADS answers 403 for a cycle directory that is still being published.
+        with patch("forecast.urlopen", side_effect=HTTPError("url", 403, "Forbidden", None, None)):
+            self.assertFalse(forecast._index_exists("noaa", "https://example.test/x.idx"))
+            with self.assertRaises(HTTPError):
+                forecast._index_exists("ecmwf", "https://example.test/x.idx")
+
     def test_ecmwf_index_path_matches_client_version(self):
         url, = forecast._index_urls("ecmwf", parse_cycle("2026110106"), 144)
         self.assertEqual(url, "https://data.ecmwf.int/forecasts/20261101/06z/ifs/0p25/wave/20261101060000-144h-wave-fc.index")

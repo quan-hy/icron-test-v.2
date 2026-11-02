@@ -1063,7 +1063,8 @@ def _index_exists(source: str, url: str) -> bool:
         _retry(probe)
         return True
     except HTTPError as exc:
-        if exc.code == 404:
+        # NOMADS answers 403 while a cycle directory is still being published.
+        if exc.code == 404 or (source == "noaa" and exc.code == 403):
             return False
         raise
 
