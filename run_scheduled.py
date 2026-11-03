@@ -52,6 +52,29 @@ def main() -> int:
         for key in ("runs", "errors"):
             if isinstance(document.get(key), list):
                 summary[f"{key}Count"] = len(document[key])
+        # Reconstruct diagnostics from fixed enums; never copy exception text or identifiers.
+        grouped: dict[tuple[str, str, str, int], int] = {}
+        for error in document.get("errors", []) if isinstance(document.get("errors"), list) else []:
+            if not isinstance(error, dict):
+                continue
+            fields = []
+            for key, allowed in (
+                ("source", ("noaa", "ecmwf", "ingest")),
+                ("operation", ("select_cycle", "collect", "post")),
+                ("code", ("cycle_unavailable", "http_error", "transport_error", "invalid_data", "unexpected_error")),
+            ):
+                value = error.get(key)
+                fields.append(value if isinstance(value, str) and value in allowed else "unknown")
+            status = error.get("httpStatus")
+            safe_status = status if fields[2] == "http_error" and type(status) is int and 300 <= status <= 599 else 0
+            group = (*fields, safe_status)
+            grouped[group] = grouped.get(group, 0) + 1
+        if grouped:
+            summary["errorSummary"] = [
+                {"source": source, "operation": operation, "code": code,
+                 **({"httpStatus": status} if status else {}), "count": count}
+                for (source, operation, code, status), count in sorted(grouped.items())
+            ]
         if isinstance(document.get("clusters"), int) and 0 <= document["clusters"] <= 30:
             summary["clusters"] = document["clusters"]
         for source in ("noaa", "ecmwf"):

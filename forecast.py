@@ -79,6 +79,10 @@ class NonRetryableError(SourceDataError):
     """A request was rejected permanently and should not be repeated."""
 
 
+class CycleUnavailableError(SourceDataError):
+    """No recent candidate has all required forecast indexes yet."""
+
+
 class NoRedirectHandler(HTTPRedirectHandler):
     """Reject redirects to preserve origin boundaries and per-request accounting."""
 
@@ -596,7 +600,19 @@ def _run(
     }
 
 
-def _source_error(spot_id: str, source: str, model: str, step: int | None, exc: Exception) -> dict[str, object]:
+def _source_error(spot_id: str, source: str, model: str, step: int | None, exc: Exception, *, operation: str = "collect") -> dict[str, object]:
+    http_error = exc.__cause__ if isinstance(exc, NonRetryableError) and isinstance(exc.__cause__, HTTPError) else exc
+    status = http_error.code if isinstance(http_error, HTTPError) else getattr(getattr(http_error, "response", None), "status_code", None)
+    if isinstance(exc, CycleUnavailableError):
+        code = "cycle_unavailable"
+    elif type(status) is int and 300 <= status <= 599:
+        code = "http_error"
+    elif isinstance(exc, (URLError, TimeoutError, ConnectionError)):
+        code = "transport_error"
+    elif isinstance(exc, SourceDataError):
+        code = "invalid_data"
+    else:
+        code = "unexpected_error"
     if isinstance(exc, HTTPError):
         detail = f"HTTP {exc.code}"
     elif isinstance(exc, URLError):
@@ -607,7 +623,10 @@ def _source_error(spot_id: str, source: str, model: str, step: int | None, exc: 
         detail = str(exc)
     else:
         detail = type(exc).__name__
-    result: dict[str, object] = {"spotId": spot_id, "source": source, "model": model, "error": detail}
+    result: dict[str, object] = {"spotId": spot_id, "source": source, "model": model, "error": detail,
+                                "operation": operation, "code": code}
+    if code == "http_error":
+        result["httpStatus"] = status
     if step is not None:
         result["step"] = step
     return result
@@ -1072,11 +1091,12 @@ def _index_exists(source: str, url: str) -> bool:
 def select_cycle(source: str, now: datetime, last_step: int) -> datetime:
     now = now.astimezone(UTC)
     boundary = now.replace(hour=(now.hour // 6) * 6, minute=0, second=0, microsecond=0)
-    for lag in (0, 6):
+    # Publication can lag past the next boundary; never select an issue >=18h old.
+    for lag in (0, 6, 12):
         cycle = boundary - timedelta(hours=lag)
         if all(_index_exists(source, url) for url in _index_urls(source, cycle, last_step)):
             return cycle
-    raise SourceDataError("neither candidate cycle has the required last-lead indexes")
+    raise CycleUnavailableError("no recent candidate cycle has the required last-lead indexes")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1150,7 +1170,8 @@ def main(argv: list[str] | None = None) -> int:
             cycles[source] = cycle if cycle is not None else select_cycle(source, datetime.now(UTC), steps[-1])
         except Exception as exc:
             models = (MODEL_NAMES["noaa-wave"], MODEL_NAMES["noaa-wind"]) if source == "noaa" else (MODEL_NAMES["ecmwf-wave"],)
-            errors.extend(_source_error(str(spot["id"]), source, model, None, exc) for spot in spots for model in models)
+            errors.extend(_source_error(str(spot["id"]), source, model, None, exc, operation="select_cycle") for spot in spots for model in models)
+            ends[source] = time.monotonic()
     clusters = cluster_spots(spots)
     print(f"NOAA clusters: {len(clusters)}", file=sys.stderr)
     tasks: list[tuple[str, Callable[[], tuple[list[dict[str, object]], list[dict[str, object]]]]]] = []
@@ -1174,7 +1195,7 @@ def main(argv: list[str] | None = None) -> int:
                 runs.extend(task_runs)
                 errors.extend(task_errors)
             except Exception as exc:
-                errors.append({"source": source, "error": type(exc).__name__})
+                errors.append(_source_error("", source, "", None, exc))
     for source in sources:
         ends.setdefault(source, time.monotonic())
 
@@ -1185,15 +1206,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 post_run(run, ingest_url, ingest_token)
             except Exception as exc:
-                errors.append(
-                    {
-                        "spotId": run["spotId"],
-                        "source": run["source"],
-                        "model": run["model"],
-                        "operation": "post",
-                        "error": _source_error("", str(run["source"]), str(run["model"]), None, exc)["error"],
-                    }
-                )
+                errors.append(_source_error(str(run["spotId"]), str(run["source"]), str(run["model"]), None, exc, operation="post"))
 
     result = {
         "clusters": len(clusters),

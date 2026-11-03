@@ -919,6 +919,79 @@ class ClusterAndCycleTests(unittest.TestCase):
             with self.assertRaises(HTTPError):
                 forecast._index_exists("ecmwf", "https://example.test/x.idx")
 
+    def test_delayed_cycle_uses_third_candidate_across_midnight(self):
+        now = datetime(2026, 11, 3, 0, 1, tzinfo=UTC)
+        with patch("forecast._index_exists", side_effect=[False, False, True]) as probe:
+            self.assertEqual(forecast.select_cycle("ecmwf", now, 144), parse_cycle("2026110212"))
+        self.assertEqual(probe.call_count, 3)
+        self.assertIn("20261102120000-144h", probe.call_args.args[1])
+
+    def test_cycle_fallback_is_bounded_and_preserves_provider_errors(self):
+        now = datetime(2026, 11, 3, 5, 59, tzinfo=UTC)
+        with patch("forecast._index_exists", return_value=False) as probe:
+            with self.assertRaises(forecast.SourceDataError):
+                forecast.select_cycle("ecmwf", now, 144)
+        self.assertEqual(probe.call_count, 3)
+        for status in (401, 403, 429, 503):
+            with self.subTest(status=status), patch("forecast._index_exists", side_effect=HTTPError("url", status, "hidden", None, None)) as probe:
+                with self.assertRaises(HTTPError):
+                    forecast.select_cycle("ecmwf", now, 144)
+                self.assertEqual(probe.call_count, 1)
+
+    def test_noaa_third_candidate_requires_wave_and_wind(self):
+        now = datetime(2026, 11, 3, 0, 1, tzinfo=UTC)
+        with patch("forecast._index_exists", side_effect=[True, False, False, True, True]) as probe:
+            self.assertEqual(forecast.select_cycle("noaa", now, 144), parse_cycle("2026110212"))
+        self.assertEqual(probe.call_count, 5)
+
+    def test_source_error_has_safe_diagnostics(self):
+        error = forecast._source_error("hidden", "ecmwf", "model", None,
+                                       HTTPError("https://hidden.invalid", 403, "secret", None, None),
+                                       operation="select_cycle")
+        self.assertEqual(error["code"], "http_error")
+        self.assertEqual(error["httpStatus"], 403)
+        self.assertEqual(error["operation"], "select_cycle")
+        with patch("forecast._index_exists", return_value=False):
+            try:
+                forecast.select_cycle("ecmwf", datetime(2026, 11, 3, tzinfo=UTC), 144)
+            except forecast.SourceDataError as exc:
+                error = forecast._source_error("hidden", "ecmwf", "model", None, exc, operation="select_cycle")
+        self.assertEqual(error["code"], "cycle_unavailable")
+
+    def test_post_rejection_retains_status_without_retry_or_secret(self):
+        for status in (302, 401, 403, 429):
+            with self.subTest(status=status), patch("forecast.build_opener") as opener:
+                opener.return_value.open.side_effect = HTTPError("https://hidden.invalid", status, "private-value", None, None)
+                with self.assertRaises(NonRetryableError) as raised:
+                    post_run({"values": []}, "https://hidden.invalid", "private-value")
+                error = forecast._source_error("spot", "noaa", "model", None, raised.exception, operation="post")
+                self.assertEqual(error["code"], "http_error")
+                self.assertEqual(error["httpStatus"], status)
+                self.assertEqual(error["operation"], "post")
+                self.assertNotIn("private-value", json.dumps(error))
+                self.assertNotIn("hidden.invalid", json.dumps(error))
+                opener.return_value.open.assert_called_once()
+
+    def test_cycle_failure_reports_stage_without_blocking_other_sources(self):
+        output = io.StringIO()
+        cycle = parse_cycle("2026110218")
+        run = {"spotId": SPOT["id"], "source": "noaa", "model": "gfs.0p25", "values": []}
+        with (
+            patch("forecast.select_cycle", side_effect=[cycle, forecast.CycleUnavailableError("not published")]),
+            patch("forecast.collect_noaa_cluster", return_value=([run], [])),
+            patch("forecast.collect_sst", return_value=([], [])),
+            patch("forecast.collect_ecmwf") as ecmwf,
+            redirect_stdout(output),
+        ):
+            self.assertEqual(main(["--spot", SPOT["id"]]), 1)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["cycles"], {"noaa": "2026-11-02T18:00:00Z"})
+        self.assertEqual(result["runs"], [run])
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertEqual(result["errors"][0]["operation"], "select_cycle")
+        self.assertEqual(result["errors"][0]["code"], "cycle_unavailable")
+        ecmwf.assert_not_called()
+
     def test_ecmwf_index_path_matches_client_version(self):
         url, = forecast._index_urls("ecmwf", parse_cycle("2026110106"), 144)
         self.assertEqual(url, "https://data.ecmwf.int/forecasts/20261101/06z/ifs/0p25/wave/20261101060000-144h-wave-fc.index")
