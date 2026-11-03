@@ -13,3 +13,15 @@ Scheduled collection loads configured public points, at most30, without developm
 The wrapper emits only whitelisted counts, selected cycles, source timings and grouped error diagnostics (fixed source/operation/code and numeric HTTP status). Raw payloads, configured origins, provider logs and endpoint errors stay in temporary invocation files and are never uploaded as artifacts. Do not add debug dumps or untrusted actions to secret-bearing workflows. Forks have no configured credentials.
 
 Provider references: [NOAA NOMADS](https://nomads.ncep.noaa.gov/), [ECMWF Open Data](https://www.ecmwf.int/en/forecasts/datasets/open-data), [NOAA CO-OPS](https://api.tidesandcurrents.noaa.gov/api/prod/). Preserve their units and source semantics. Model forecasts and dated analyses do not guarantee local conditions.
+
+## Weekly regional research candidates
+
+A separate `Weekly content candidates` workflow runs Mondays at 03:17 UTC (12:17 KST) on the standard Ubuntu runner. It uses no secrets, paid APIs, AI generation, image downloads or application writes. The existing forecast workflow and its enablement are unchanged.
+
+Eight official regional pages contribute titles and same-origin related links only. Robots restrictions, redirects, authentication and response limits are respected conservatively; a blocked page remains a manual review item. Wikimedia Commons searches return at most six license-filtered photo candidates per region. Search topics rotate weekly. Collection failures remain visible rather than being treated as empty successful results.
+
+The `regional-candidates-<run id>` artifact is retained for 14 days. All candidates are pending human review; source timestamps are collection times, not publication dates or field verification. Verify exact photo location, author attribution, license and depicted-person restrictions before reuse. Community posts are never collected or exported. No automatic publishing is configured.
+
+Offline validation: `node --experimental-strip-types --test tests/content-discovery.test.ts`. Preview sources without network: `node --experimental-strip-types tools/content/collect.ts`. Authorized collection: `node --experimental-strip-types tools/content/collect.ts --execute --output /tmp/ivysurf-candidates`.
+
+Public scheduled workflows may be disabled after 60 days without repository activity; check Actions status during the weekly editorial review.
