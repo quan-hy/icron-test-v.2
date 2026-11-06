@@ -1,6 +1,6 @@
 # icron test v.2
 
-Bounded NOAA GFS/GFS-Wave, ECMWF wave and NOAA RTG SST collection. Sources, models, grids and issue times remain separate. Missing data is omitted. No safety assessment is performed.
+Bounded NOAA GFS/GFS-Wave, ECMWF wave/10 m wind and NOAA RTG SST collection. Sources, models, grids and issue times remain separate. Missing data is omitted. No safety assessment is performed.
 
 Install pinned dependencies in `requirements.txt`. Offline tests: `python -m unittest discover -p 'test_*.py'`.
 
@@ -13,6 +13,22 @@ Scheduled collection loads configured public points, at most30, without developm
 The wrapper emits only whitelisted counts, selected cycles, source timings and grouped error diagnostics (fixed source/operation/code and numeric HTTP status). Raw payloads, configured origins, provider logs and endpoint errors stay in temporary invocation files and are never uploaded as artifacts. Do not add debug dumps or untrusted actions to secret-bearing workflows. Forks have no configured credentials.
 
 Provider references: [NOAA NOMADS](https://nomads.ncep.noaa.gov/), [ECMWF Open Data](https://www.ecmwf.int/en/forecasts/datasets/open-data), [NOAA CO-OPS](https://api.tidesandcurrents.noaa.gov/api/prod/). Preserve their units and source semantics. Model forecasts and dated analyses do not guarantee local conditions.
+
+## ECMWF finer grid
+
+The collector prefers the ECMWF IFS 0.1° open distribution, with separate
+`ifs.wave.0p1` and `ifs.0p1` model identifiers. The native atmosphere and wave
+models are approximately 9 km; coastal masks can still map adjacent points to the
+same ocean cell. Data are provided by ECMWF under CC BY 4.0. Mean wave period is
+not interchangeable with NOAA primary-wave period.
+
+The official Google mirror supplies the 0.1° files. Availability checks require
+both wave and atmosphere final-lead indexes. The 144-hour collection uses 00/12
+UTC cycles; 06/18 UTC 0.1° forecasts end at 90 hours. Missing publication falls
+back to legacy 0.25° wave collection, while NOAA remains independent. Transport
+and authorization failures stay visible. The pinned SDK's surface filenames and
+single-range requests are adapted without changing dependencies, request timeouts,
+concurrency, batch limits, source timestamps or missing-data handling.
 
 ## Weekly regional research candidates
 

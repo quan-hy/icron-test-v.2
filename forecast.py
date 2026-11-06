@@ -51,6 +51,8 @@ MODEL_NAMES = {
     "noaa-wind": "gfs.0p25",
     "noaa-sst": "rtgssthr.0p083",
     "ecmwf-wave": "ifs.wave.0p25",
+    "ecmwf-wave-0p1": "ifs.wave.0p1",
+    "ecmwf-wind-0p1": "ifs.0p1",
 }
 
 # Approximate development fixtures; scheduled collection always loads configured public points.
@@ -714,7 +716,7 @@ def collect_noaa_spot(spot: dict[str, float | str], cycle: datetime, steps: tupl
     return collect_noaa_cluster((spot,), cycle, steps)
 
 
-def _ecmwf_payload(client: object, cycle: datetime, step: int) -> bytes:
+def _ecmwf_payload(client: object, cycle: datetime, step: int, kind: str = "wave") -> bytes:
     def retrieve() -> bytes:
         with tempfile.TemporaryDirectory(prefix="icron-ecmwf-") as directory:
             target = str(Path(directory) / "wave.grib2")
@@ -722,14 +724,17 @@ def _ecmwf_payload(client: object, cycle: datetime, step: int) -> bytes:
                 client.retrieve(  # type: ignore[attr-defined]
                     date=cycle.strftime("%Y%m%d"),
                     time=cycle.hour,
-                    stream="wave",
+                    stream="wave" if kind == "wave" else "oper",
                     type="fc",
                     step=step,
                     levtype="sfc",
-                    param=["swh", "mwd", "mwp", "pp1d"],
+                    param=["swh", "mwd", "mwp", "pp1d"] if kind == "wave" else ["10u", "10v", "2t"],
                     target=target,
                 )
-            payload = Path(target).read_bytes()
+            with Path(target).open("rb") as data:
+                payload = data.read(MAX_DOWNLOAD_BYTES + 1)
+        if len(payload) > MAX_DOWNLOAD_BYTES:
+            raise SourceDataError("ECMWF GRIB exceeds the download size limit")
         if not payload.startswith(b"GRIB"):
             raise SourceDataError("ECMWF Open Data returned a non-GRIB response")
         return payload
@@ -760,83 +765,87 @@ def _set_ecmwf_timeouts(client: object) -> None:
         setattr(session, method_name, bounded)
 
 
+def _set_ecmwf_0p1_paths(client: object) -> None:
+    """Adapt 0.3.34's data URLs to the 0.1-degree surface file naming."""
+    original = client.get_parts  # type: ignore[attr-defined]
+
+    @wraps(original)
+    def surface_parts(urls: list[str], for_index: object):
+        corrected = []
+        for url in urls:
+            if not url.endswith("-fc.grib2"):
+                raise SourceDataError("unexpected ECMWF 0.1-degree data path")
+            corrected.append(url[:-len(".grib2")] + "-sfc.grib2")
+        # Single-range entries keep multiurl on the bounded, counted client session.
+        # Its non-multipart fallback otherwise sends later ranges via requests.get.
+        groups = original(corrected, for_index)
+        return [(url, (part,)) for url, parts in groups for part in parts]
+
+    client.get_parts = surface_parts  # type: ignore[attr-defined]
+
+
 def collect_ecmwf(
-    spots: tuple[dict[str, float | str], ...], cycle: datetime, steps: tuple[int, ...]
+    spots: tuple[dict[str, float | str], ...], cycle: datetime, steps: tuple[int, ...],
+    resolution: str = "0p25",
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    products = (("wave", MODEL_NAMES["ecmwf-wave"]),) if resolution == "0p25" else (
+        ("wave", MODEL_NAMES["ecmwf-wave-0p1"]), ("wind", MODEL_NAMES["ecmwf-wind-0p1"]),
+    )
     try:
         from ecmwf.opendata import Client
 
         with redirect_stdout(sys.stderr):
             client = Client(
-                source="ecmwf",
-                model="ifs",
-                resol="0p25",
-                maximum_retries=0,
-                retry_after=1,
-                use_server_retry_after=False,
+                source="google" if resolution == "0p1" else "ecmwf", model="ifs", resol=resolution, maximum_retries=0,
+                retry_after=1, use_server_retry_after=False,
             )
         _set_ecmwf_timeouts(client)
+        if resolution == "0p1":
+            _set_ecmwf_0p1_paths(client)
     except Exception as exc:
         return [], [
-            _source_error(str(spot["id"]), "ecmwf", MODEL_NAMES["ecmwf-wave"], None, exc)
-            for spot in spots
+            _source_error(str(spot["id"]), "ecmwf", model, None, exc)
+            for spot in spots for _, model in products
         ]
     issue_at = iso_utc(cycle)
-    values_by_spot = {str(spot["id"]): [] for spot in spots}
-    grid_by_spot: dict[str, dict[str, float] | None] = {str(spot["id"]): None for spot in spots}
     errors: list[dict[str, object]] = []
-    for step in steps:
-        valid_at = expected_valid_at(cycle, step)
-        try:
-            payload = _ecmwf_payload(client, cycle, step)
-        except Exception as exc:
-            errors.extend(
-                _source_error(str(spot["id"]), "ecmwf", MODEL_NAMES["ecmwf-wave"], step, exc)
-                for spot in spots
-            )
-            if _blocks_source_after_retry(exc):
-                break
-            continue
-        try:
-            decoded = decode_grib(payload, spots)
-        except Exception as exc:
-            errors.extend(
-                _source_error(str(spot["id"]), "ecmwf", MODEL_NAMES["ecmwf-wave"], step, exc)
-                for spot in spots
-            )
-            continue
+    runs: list[dict[str, object]] = []
+    for kind, model in products:
+        values_by_spot = {str(spot["id"]): [] for spot in spots}
+        grid_by_spot: dict[str, dict[str, float] | None] = {str(spot["id"]): None for spot in spots}
+        for step in steps:
+            valid_at = expected_valid_at(cycle, step)
+            try:
+                payload = _ecmwf_payload(client, cycle, step, kind)
+            except Exception as exc:
+                errors.extend(_source_error(str(spot["id"]), "ecmwf", model, step, exc) for spot in spots)
+                if _blocks_source_after_retry(exc):
+                    break
+                continue
+            try:
+                decoded = decode_grib(payload, spots)
+            except Exception as exc:
+                errors.extend(_source_error(str(spot["id"]), "ecmwf", model, step, exc) for spot in spots)
+                continue
+            for spot in spots:
+                spot_id = str(spot["id"])
+                try:
+                    if kind == "wave":
+                        grid, values = normalize_wave_step(decoded[spot_id], spot, issue_at, valid_at, ecmwf=True)
+                    else:
+                        grid, values = normalize_wind_step(decoded[spot_id], spot, issue_at, valid_at)
+                    grid_by_spot[spot_id] = require_stable_grid(grid_by_spot[spot_id], grid)
+                    values_by_spot[spot_id].extend(values)
+                except Exception as exc:
+                    errors.append(_source_error(spot_id, "ecmwf", model, step, exc))
+        fetched_at = iso_utc(datetime.now(UTC))
         for spot in spots:
             spot_id = str(spot["id"])
-            try:
-                grid, values = normalize_wave_step(
-                    decoded[spot_id], spot, issue_at, valid_at, ecmwf=True
-                )
-                grid_by_spot[spot_id] = require_stable_grid(grid_by_spot[spot_id], grid)
-                values_by_spot[spot_id].extend(values)
-            except Exception as exc:
-                errors.append(
-                    _source_error(spot_id, "ecmwf", MODEL_NAMES["ecmwf-wave"], step, exc)
-                )
-    fetched_at = iso_utc(datetime.now(UTC))
-    runs = []
-    for spot in spots:
-        spot_id = str(spot["id"])
-        values = values_by_spot[spot_id]
-        run = _run(
-            spot_id,
-            "ecmwf",
-            MODEL_NAMES["ecmwf-wave"],
-            issue_at,
-            fetched_at,
-            grid_by_spot[spot_id],
-            values,
-        )
-        if run:
-            runs.append(run)
-        elif not any(error["spotId"] == spot_id for error in errors):
-            errors.append(
-                _source_error(spot_id, "ecmwf", MODEL_NAMES["ecmwf-wave"], None, SourceDataError("no valid grid values"))
-            )
+            run = _run(spot_id, "ecmwf", model, issue_at, fetched_at, grid_by_spot[spot_id], values_by_spot[spot_id])
+            if run:
+                runs.append(run)
+            elif not any(error["spotId"] == spot_id and error["model"] == model for error in errors):
+                errors.append(_source_error(spot_id, "ecmwf", model, None, SourceDataError("no valid grid values")))
     return runs, errors
 
 
@@ -1051,12 +1060,15 @@ def post_run(run: dict[str, object], ingest_url: str, token: str) -> None:
     _retry(send)
 
 
-def _index_urls(source: str, cycle: datetime, step: int) -> tuple[str, ...]:
+def _index_urls(source: str, cycle: datetime, step: int, resolution: str = "0p25") -> tuple[str, ...]:
     date, hour = cycle.strftime("%Y%m%d"), cycle.strftime("%H")
     if source == "noaa":
         base = f"{NOMADS}/pub/data/nccf/com/gfs/prod/gfs.{date}/{hour}"
         return (f"{base}/wave/gridded/gfswave.t{hour}z.global.0p25.f{step:03d}.grib2.idx",
                 f"{base}/atmos/gfs.t{hour}z.pgrb2.0p25.f{step:03d}.idx")
+    if resolution == "0p1":
+        base = f"https://storage.googleapis.com/ecmwf-open-data/{date}/{hour}z/ifs/0p1"
+        return tuple(f"{base}/{stream}/{date}{hour}0000-{step}h-{stream}-fc-sfc.index" for stream in ("wave", "oper"))
     stream = "scwv" if cycle.date() < datetime(2026, 5, 12).date() and cycle.hour in (6, 18) else "wave"
     return (f"https://data.ecmwf.int/forecasts/{date}/{hour}z/ifs/0p25/{stream}/"
             f"{date}{hour}0000-{step}h-{stream}-fc.index",)
@@ -1097,6 +1109,24 @@ def select_cycle(source: str, now: datetime, last_step: int) -> datetime:
         if all(_index_exists(source, url) for url in _index_urls(source, cycle, last_step)):
             return cycle
     raise CycleUnavailableError("no recent candidate cycle has the required last-lead indexes")
+
+
+def select_ecmwf_source(now: datetime, last_step: int, explicit_cycle: datetime | None = None) -> tuple[datetime, str]:
+    """Prefer a complete 0.1-degree pair; only missing indexes permit 0.25 fallback."""
+    now = now.astimezone(UTC)
+    boundary = now.replace(hour=(now.hour // 6) * 6, minute=0, second=0, microsecond=0)
+    candidates = (explicit_cycle,) if explicit_cycle else tuple(boundary - timedelta(hours=lag) for lag in (0, 6, 12))
+    for cycle in candidates:
+        # The 06/18 IFS runs end at 90 hours.
+        if cycle.date() < datetime(2026, 10, 20).date() or (last_step > 90 and cycle.hour in (6, 18)):
+            continue
+        if all(_index_exists("ecmwf", url) for url in _index_urls("ecmwf", cycle, last_step, "0p1")):
+            return cycle, "0p1"
+    if explicit_cycle is not None:
+        if all(_index_exists("ecmwf", url) for url in _index_urls("ecmwf", explicit_cycle, last_step)):
+            return explicit_cycle, "0p25"
+        raise CycleUnavailableError("requested cycle has no required forecast indexes")
+    return select_cycle("ecmwf", now, last_step), "0p25"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1165,9 +1195,13 @@ def main(argv: list[str] | None = None) -> int:
     ends: dict[str, float] = {}
     cycles: dict[str, datetime] = {}
     errors: list[dict[str, object]] = []
+    ecmwf_resolution = "0p25"
     for source in sources:
         try:
-            cycles[source] = cycle if cycle is not None else select_cycle(source, datetime.now(UTC), steps[-1])
+            if source == "ecmwf":
+                cycles[source], ecmwf_resolution = select_ecmwf_source(datetime.now(UTC), steps[-1], cycle)
+            else:
+                cycles[source] = cycle if cycle is not None else select_cycle(source, datetime.now(UTC), steps[-1])
         except Exception as exc:
             models = (MODEL_NAMES["noaa-wave"], MODEL_NAMES["noaa-wind"]) if source == "noaa" else (MODEL_NAMES["ecmwf-wave"],)
             errors.extend(_source_error(str(spot["id"]), source, model, None, exc, operation="select_cycle") for spot in spots for model in models)
@@ -1180,7 +1214,7 @@ def main(argv: list[str] | None = None) -> int:
             tasks.extend(("noaa", lambda cluster=cluster: collect_noaa_cluster(cluster, cycles["noaa"], steps)) for cluster in clusters)
         tasks.append(("noaa", lambda: collect_sst(spots, sst_date)))
     if "ecmwf" in cycles:
-        tasks.append(("ecmwf", lambda: collect_ecmwf(spots, cycles["ecmwf"], steps)))
+        tasks.append(("ecmwf", lambda: collect_ecmwf(spots, cycles["ecmwf"], steps, ecmwf_resolution)))
 
     runs: list[dict[str, object]] = []
     # Start the shared model alongside NOAA, rather than after every region's queue.

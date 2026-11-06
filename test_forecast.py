@@ -663,6 +663,7 @@ class PublicSpotInputTests(unittest.TestCase):
             patch("forecast.fetch_public_spots", return_value=(spot,)),
             patch("forecast.collect_noaa_cluster", return_value=empty_result) as noaa,
             patch("forecast.collect_sst", return_value=empty_result) as sst,
+            patch("forecast.select_ecmwf_source", return_value=(parse_cycle("2026101300"), "0p1")),
             patch("forecast.collect_ecmwf", return_value=empty_result) as ecmwf,
             redirect_stdout(io.StringIO()),
         ):
@@ -673,7 +674,7 @@ class PublicSpotInputTests(unittest.TestCase):
 
         noaa.assert_called_once_with((spot,), parse_cycle("2026101300"), DEFAULT_STEPS)
         sst.assert_called_once_with((spot,), parse_sst_date("20261012"))
-        ecmwf.assert_called_once_with((spot,), parse_cycle("2026101300"), DEFAULT_STEPS)
+        ecmwf.assert_called_once_with((spot,), parse_cycle("2026101300"), DEFAULT_STEPS, "0p1")
 
     def test_post_budget_checks_the_entire_batch_before_any_write(self):
         for count, expected_status in ((forecast.MAX_POST_VALUES, 0), (forecast.MAX_POST_VALUES + 1, 1)):
@@ -977,7 +978,8 @@ class ClusterAndCycleTests(unittest.TestCase):
         cycle = parse_cycle("2026110218")
         run = {"spotId": SPOT["id"], "source": "noaa", "model": "gfs.0p25", "values": []}
         with (
-            patch("forecast.select_cycle", side_effect=[cycle, forecast.CycleUnavailableError("not published")]),
+            patch("forecast.select_cycle", return_value=cycle),
+            patch("forecast.select_ecmwf_source", side_effect=forecast.CycleUnavailableError("not published")),
             patch("forecast.collect_noaa_cluster", return_value=([run], [])),
             patch("forecast.collect_sst", return_value=([], [])),
             patch("forecast.collect_ecmwf") as ecmwf,
@@ -1016,3 +1018,106 @@ class ClusterAndCycleTests(unittest.TestCase):
         wave, wind = forecast._index_urls("noaa", parse_cycle("2026110100"), 144)
         self.assertTrue(wave.endswith("/wave/gridded/gfswave.t00z.global.0p25.f144.grib2.idx"))
         self.assertTrue(wind.endswith("/atmos/gfs.t00z.pgrb2.0p25.f144.idx"))
+
+
+class ECMWFHighResolutionTests(unittest.TestCase):
+    def test_index_names_and_resolution_selection_for_horizons(self):
+        cycle = parse_cycle("2026110606")
+        wave, oper = forecast._index_urls("ecmwf", cycle, 90, "0p1")
+        self.assertTrue(all(url.startswith("https://storage.googleapis.com/ecmwf-open-data/") for url in (wave, oper)))
+        self.assertTrue(wave.endswith("/ifs/0p1/wave/20261106060000-90h-wave-fc-sfc.index"))
+        self.assertTrue(oper.endswith("/ifs/0p1/oper/20261106060000-90h-oper-fc-sfc.index"))
+        now = datetime(2026, 11, 6, 11, tzinfo=UTC)
+        with patch("forecast._index_exists", return_value=True) as probe:
+            self.assertEqual(forecast.select_ecmwf_source(now, 90), (cycle, "0p1"))
+            self.assertEqual(probe.call_count, 2)
+        with patch("forecast._index_exists", return_value=True) as probe:
+            self.assertEqual(forecast.select_ecmwf_source(now, 144), (parse_cycle("2026110600"), "0p1"))
+            self.assertTrue(all("20261106000000-144h" in call.args[1] for call in probe.call_args_list))
+
+    def test_missing_high_resolution_pair_falls_back_and_errors_propagate(self):
+        now = datetime(2026, 11, 6, 11, tzinfo=UTC)
+        def exists(source, url):
+            return "/0p25/" in url
+        with patch("forecast._index_exists", side_effect=exists):
+            self.assertEqual(forecast.select_ecmwf_source(now, 144), (parse_cycle("2026110606"), "0p25"))
+        with patch("forecast._index_exists", return_value=False):
+            with self.assertRaises(forecast.CycleUnavailableError):
+                forecast.select_ecmwf_source(now, 144)
+        for status in (401, 403, 429, 503):
+            with self.subTest(status=status), patch("forecast._index_exists", side_effect=HTTPError("url", status, "error", None, None)):
+                with self.assertRaises(HTTPError):
+                    forecast.select_ecmwf_source(now, 144)
+
+    def test_explicit_short_cycle_long_horizon_uses_fallback(self):
+        cycle = parse_cycle("2026110606")
+        with patch("forecast._index_exists", return_value=True) as probe:
+            self.assertEqual(forecast.select_ecmwf_source(cycle, 144, cycle), (cycle, "0p25"))
+            self.assertEqual(probe.call_count, 1)
+            self.assertIn("/0p25/", probe.call_args.args[1])
+
+    def test_products_keep_provenance_and_wind_convention(self):
+        cycle = parse_cycle("2026101300")
+        records = [sample("swh", 1.5, units="m", level=0), sample("pp1d", 12, units="s", level=0),
+                   sample("10u", 3, units="m s**-1", level_type="heightAboveGround", level=10),
+                   sample("10v", 4, units="m s**-1", level_type="heightAboveGround", level=10)]
+        class Session:
+            def get(self, *args, **kwargs): pass
+            def head(self, *args, **kwargs): pass
+        class Client:
+            def __init__(self, **kwargs): self.session = Session()
+            def get_parts(self, urls, for_index): return urls
+        mod = types.ModuleType("ecmwf.opendata")
+        mod.Client = Client
+        with (patch.dict(sys.modules, {"ecmwf": types.ModuleType("ecmwf"), "ecmwf.opendata": mod}),
+              patch("forecast._ecmwf_payload", return_value=b"GRIB"),
+              patch("forecast.decode_grib", return_value={SPOT["id"]: records})):
+            runs, errors = collect_ecmwf((SPOT,), cycle, (3,), "0p1")
+        self.assertEqual(errors, [])
+        by_model = {run["model"]: run for run in runs}
+        self.assertEqual(set(by_model), {"ifs.wave.0p1", "ifs.0p1"})
+        wave = {v["variable"]: v["value"] for v in by_model["ifs.wave.0p1"]["values"]}
+        wind = {v["variable"]: v["value"] for v in by_model["ifs.0p1"]["values"]}
+        self.assertEqual(wave["peak_period_s"], 12)
+        self.assertNotIn("wave_period_s", wave)
+        self.assertEqual(wind["wind_speed_ms"], 5)
+        self.assertAlmostEqual(wind["wind_direction_deg"], 216.86989764584402)
+        self.assertEqual(by_model["ifs.0p1"]["issuedAt"], ISSUE)
+
+    def test_payload_requests_matching_stream_parameters(self):
+        requests = []
+        class Client:
+            def retrieve(self, **kwargs):
+                requests.append(kwargs)
+                Path(kwargs["target"]).write_bytes(b"GRIB")
+        forecast._ecmwf_payload(Client(), parse_cycle("2026110600"), 3, "wave")
+        forecast._ecmwf_payload(Client(), parse_cycle("2026110600"), 3, "wind")
+        self.assertEqual(requests[0]["stream"], "wave")
+        self.assertEqual(requests[1]["stream"], "oper")
+        self.assertEqual(requests[1]["param"], ["10u", "10v", "2t"])
+
+    def test_client_0p1_data_paths_match_surface_indexes(self):
+        class Client:
+            def get_parts(self, urls, for_index): return [(urls[0], ((10, 20), (40, 30)))]
+        client = Client()
+        forecast._set_ecmwf_0p1_paths(client)
+        url = "https://data.ecmwf.int/forecasts/20261106/00z/ifs/0p1/wave/20261106000000-24h-wave-fc.grib2"
+        corrected = url.replace("-fc.grib2", "-fc-sfc.grib2")
+        self.assertEqual(client.get_parts([url], {}), [(corrected, ((10, 20),)), (corrected, ((40, 30),))])
+        with self.assertRaises(forecast.SourceDataError):
+            client.get_parts(["https://example.test/unexpected"], {})
+
+    def test_historical_explicit_cycle_uses_existing_resolution(self):
+        cycle = parse_cycle("2026101300")
+        with patch("forecast._index_exists", return_value=True) as probe:
+            self.assertEqual(forecast.select_ecmwf_source(cycle, 90, cycle), (cycle, "0p25"))
+            self.assertIn("/0p25/", probe.call_args.args[1])
+
+    def test_ecmwf_rejects_oversized_grib(self):
+        class Client:
+            def retrieve(self, **kwargs):
+                with Path(kwargs["target"]).open("wb") as data:
+                    data.write(b"GRIB")
+                    data.truncate(forecast.MAX_DOWNLOAD_BYTES + 1)
+        with self.assertRaisesRegex(forecast.SourceDataError, "size limit"):
+            forecast._ecmwf_payload(Client(), parse_cycle("2026110600"), 0)
