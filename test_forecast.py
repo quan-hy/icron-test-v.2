@@ -588,7 +588,7 @@ class PublicSpotInputTests(unittest.TestCase):
 
         self.assertEqual(spots[0]["id"], "release-spot")
         request, timeout = requests[0]
-        self.assertEqual(request.full_url, "https://ingest.example.test/spots")
+        self.assertEqual(request.full_url, "https://ingest.example.test/spots?view=catalog")
         self.assertEqual(request.get_method(), "GET")
         self.assertIsNone(request.get_header("Authorization"))
         self.assertEqual(timeout, 30)

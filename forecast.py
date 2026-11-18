@@ -931,7 +931,7 @@ def parse_public_spots(payload: bytes) -> tuple[dict[str, float | str], ...]:
 
 def fetch_public_spots(ingest_url: str) -> tuple[dict[str, float | str], ...]:
     origin = validate_ingest_origin(ingest_url)
-    url = origin + "/spots"
+    url = origin + "/spots?view=catalog"
     handlers = [NoRedirectHandler()]
     if origin.startswith("http://"):
         handlers.insert(0, ProxyHandler({}))
