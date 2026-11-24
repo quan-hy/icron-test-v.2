@@ -8,6 +8,7 @@ import {
 } from '../tools/content/collect.ts';
 import { boundedText, permitsResearch } from '../tools/content/research-http.ts';
 import { DISCOVERY_SOURCES } from '../tools/content/sources.ts';
+import { searchOpenverse } from '../tools/images/openverse.ts';
 import { searchCommons } from '../tools/images/search.ts';
 
 test('research respects applicable robot restrictions and fails before fetching blocked pages', async () => {
@@ -84,6 +85,7 @@ test('weekly report preserves partial failures and leaves every region pending p
     const url = new URL(String(input));
     if (url.pathname === '/robots.txt') return new Response('', { status: 404 });
     if (url.hostname === 'commons.wikimedia.org') return Response.json({ query: { pages: [] } });
+    if (url.hostname === 'api.openverse.org') return Response.json({ results: [] });
     if (url.href === DISCOVERY_SOURCES[0].url) return new Response('', { status: 503 });
     return new Response('<title>Official beach guide</title>', {
       headers: { 'content-type': 'text/html' },
@@ -132,5 +134,85 @@ test('an outage of either automatic source category fails even when the other wo
           });
     });
     assert.equal(summarizeCandidates(report).failed, true, broken);
+  }
+});
+
+test('Openverse retains original source and verified license metadata for review', async () => {
+  const item = {
+    title: 'Beach',
+    creator: 'Photographer',
+    source: 'flickr',
+    mature: false,
+    foreign_landing_url: 'https://www.flickr.com/photos/example/123',
+    license: 'by',
+    license_version: '2.0',
+    license_url: 'https://creativecommons.org/licenses/by/2.0/',
+  };
+  const response = await searchOpenverse('Sunset Beach', async (input, init) => {
+    const url = new URL(String(input));
+    assert.equal(url.origin, 'https://api.openverse.org');
+    assert.equal(url.searchParams.get('q'), 'Sunset Beach');
+    assert.equal(url.searchParams.get('excluded_source'), 'wikimedia');
+    assert.equal(url.searchParams.get('license'), 'by,cc0');
+    assert.equal(init?.redirect, 'error');
+    return Response.json({
+      results: [
+        item,
+        item,
+        { ...item, source: 'wikimedia' },
+        { ...item, license: 'by-nc' },
+        { ...item, license_url: 'https://other.org/' },
+        { ...item, mature: true },
+      ].map((r, i) => (i < 2 ? r : { ...r, foreign_landing_url: item.foreign_landing_url + i })),
+    });
+  });
+  assert.equal(response.candidates.length, 1);
+  assert.equal(response.candidates[0]?.source, item.foreign_landing_url);
+  assert.equal(response.candidates[0]?.license, 'CC BY 2.0');
+  assert.equal(response.candidates[0]?.creator, item.creator);
+});
+
+test('Openverse runs only after an eligible empty search and preserves primary results on fallback failure', async () => {
+  const now = new Date('2026-11-24T00:00:00Z');
+  for (const mode of ['empty', 'hit', 'outage']) {
+    const requested: string[] = [];
+    const report = await collectCandidates(now, async (input) => {
+      const url = new URL(String(input));
+      if (url.hostname === 'api.openverse.org') {
+        requested.push(url.searchParams.get('q')!);
+        return new Response('', { status: 429 });
+      }
+      if (url.hostname === 'commons.wikimedia.org') {
+        if (mode === 'outage') return new Response('', { status: 503 });
+        return Response.json({
+          query: {
+            pages:
+              mode === 'hit'
+                ? [
+                    {
+                      title: 'Beach',
+                      imageinfo: [{ extmetadata: { LicenseShortName: { value: 'CC0' } } }],
+                    },
+                  ]
+                : [],
+          },
+        });
+      }
+      if (url.pathname === '/robots.txt') return new Response('', { status: 404 });
+      return new Response('<title>Coast</title>', { headers: { 'content-type': 'text/html' } });
+    });
+    const attempted = report.regions.filter((r) => r.openverse);
+    assert.deepEqual(
+      attempted.map((r) => r.region),
+      mode === 'empty' ? ['bali', 'hawaii'] : [],
+    );
+    assert.deepEqual(
+      requested,
+      attempted.map((r) => (r.photos.status === 'empty' ? r.photos.data.query : null)),
+    );
+    if (mode === 'empty') {
+      assert.equal(summarizeCandidates(report).failed, false);
+      assert.match(summarizeCandidates(report).markdown, /bali.*empty.*openverse_http_429/);
+    }
   }
 });

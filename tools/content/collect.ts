@@ -1,6 +1,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { searchOpenverse } from '../images/openverse.ts';
 import { searchCommons } from '../images/search.ts';
 import { boundedText, permitsResearch, researchFetch } from './research-http.ts';
 import { DISCOVERY_SOURCES } from './sources.ts';
@@ -90,7 +91,20 @@ export async function collectCandidates(now = new Date(), fetcher: typeof fetch 
         error: error instanceof Error ? error.message : 'photos_failed',
       }),
     );
-    regions.push({ region: source.region, official, photos });
+    const openverse =
+      photos.status === 'empty' && (source.region === 'bali' || source.region === 'hawaii')
+        ? await searchOpenverse(query, fetcher).then(
+            (data) => ({
+              status: data.candidates.length ? ('collected' as const) : ('empty' as const),
+              data,
+            }),
+            (error: unknown) => ({
+              status: 'needs_attention' as const,
+              error: error instanceof Error ? error.message : 'openverse_failed',
+            }),
+          )
+        : undefined;
+    regions.push({ region: source.region, official, photos, openverse });
   }
   return {
     schema: 2,
@@ -119,7 +133,13 @@ export function summarizeCandidates(report: Awaited<ReturnType<typeof collectCan
     /^[a-z_0-9]{1,64}$|^Commons HTTP \d{3}; no automatic retry\.$/.test(message)
       ? message
       : 'see candidates.json';
-  const rows = regions.map(({ region, official, photos }) => {
+  const extraPhotos = regions.reduce(
+    (sum, { openverse }) =>
+      sum +
+      (openverse && openverse.status !== 'needs_attention' ? openverse.data.candidates.length : 0),
+    0,
+  );
+  const rows = regions.map(({ region, official, photos, openverse }) => {
     const page =
       official.status === 'manual_review'
         ? `[manual_review](${official.url}) (${official.reason})`
@@ -130,7 +150,12 @@ export function summarizeCandidates(report: Awaited<ReturnType<typeof collectCan
       photos.status === 'needs_attention'
         ? `needs_attention (${diagnostic(photos.error)})`
         : `${photos.status} (${photos.data.candidates.length})`;
-    return `| ${region} | ${page} | ${photo} |`;
+    const extra = !openverse
+      ? '—'
+      : openverse.status === 'needs_attention'
+        ? `needs_attention (${diagnostic(openverse.error)})`
+        : `${openverse.status} (${openverse.data.candidates.length})`;
+    return `| ${region} | ${page} | ${photo} | ${extra} |`;
   });
   const markdown = [
     '# Weekly research candidates',
@@ -138,11 +163,11 @@ export function summarizeCandidates(report: Awaited<ReturnType<typeof collectCan
     `Collected: ${report.collectedAt}`,
     '',
     `Official pages collected: ${official} of ${regions.length - manual} automatic. Manual review: ${manual}.`,
-    `Photo candidates: ${photoCount}. Successful photo searches: ${photoChecks} of ${regions.length}.`,
+    `Photo candidates: ${photoCount + extraPhotos} (Commons: ${photoCount}, Openverse: ${extraPhotos}). Successful Commons searches: ${photoChecks} of ${regions.length}.`,
     ...(failed ? ['', 'Action required: an entire automatic source category is unavailable.'] : []),
     '',
-    '| Region | Official page | Photo search (candidates) |',
-    '| --- | --- | --- |',
+    '| Region | Official page | Commons | Openverse fallback |',
+    '| --- | --- | --- | --- |',
     ...rows,
     '',
     'Pending human review. See candidates.json for source links and license details. Collection time is not a publication date or field check.',
