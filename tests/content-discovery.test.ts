@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { collectCandidates, collectOfficial, officialMetadata } from '../tools/content/collect.ts';
+import {
+  collectCandidates,
+  collectOfficial,
+  officialMetadata,
+  summarizeCandidates,
+} from '../tools/content/collect.ts';
 import { boundedText, permitsResearch } from '../tools/content/research-http.ts';
 import { DISCOVERY_SOURCES } from '../tools/content/sources.ts';
 import { searchCommons } from '../tools/images/search.ts';
@@ -89,9 +94,43 @@ test('weekly report preserves partial failures and leaves every region pending p
   assert.equal(report.approvedForPublication, false);
   assert.equal(report.regions.length, 8);
   assert.equal(report.regions[0]?.official.status, 'needs_attention');
-  assert.equal(report.regions[1]?.official.status, 'collected');
+  const manual = report.regions.filter((r) => r.official.status === 'manual_review');
+  assert.deepEqual(
+    manual.map((r) => r.region),
+    ['california', 'tahiti'],
+  );
+  const summary = summarizeCandidates(report);
+  assert.equal(summary.failed, false);
+  assert.match(summary.markdown, /Official pages collected: 5 of 6 automatic/);
+  assert.match(summary.markdown, /Photo candidates: 0/);
+  assert.match(summary.markdown, /bali.*source_http_503/);
+  assert.match(summary.markdown, /california.*manual_review/);
+  for (const r of manual) {
+    const url = DISCOVERY_SOURCES.find((s) => s.region === r.region)!.url;
+    await assert.rejects(
+      collectOfficial(url, () => assert.fail('manual source requested')),
+      /manual_review/,
+    );
+  }
   assert.equal(
-    report.regions.every((region) => region.photos.status === 'collected'),
+    report.regions.every((region) => region.photos.status === 'empty'),
     true,
   );
+});
+
+test('an outage of either automatic source category fails even when the other works', async () => {
+  for (const broken of ['photos', 'official']) {
+    const report = await collectCandidates(new Date(), async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/robots.txt') return new Response('', { status: 404 });
+      const photos = url.hostname === 'commons.wikimedia.org';
+      if (photos === (broken === 'photos')) return new Response('', { status: 503 });
+      return photos
+        ? Response.json({ query: { pages: [] } })
+        : new Response('<title>Official beach</title>', {
+            headers: { 'content-type': 'text/html' },
+          });
+    });
+    assert.equal(summarizeCandidates(report).failed, true, broken);
+  }
 });

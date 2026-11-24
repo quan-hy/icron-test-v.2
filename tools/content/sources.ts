@@ -7,6 +7,7 @@ export const DISCOVERY_SOURCES = [
   },
   {
     region: 'california',
+    manualReview: 'robots_requires_manual_review',
     url: 'https://www.visitcalifornia.com/places-to-visit/huntington-beach/',
     photos: ['Huntington Beach coast', 'La Jolla Shores beach', 'Doheny State Beach'],
   },
@@ -17,7 +18,7 @@ export const DISCOVERY_SOURCES = [
   },
   {
     region: 'hawaii',
-    url: 'https://www.gohawaii.com/islands/oahu/things-to-do/beaches/waikiki-beach',
+    url: 'https://dlnr.hawaii.gov/dobor/waikiki-beach-waters/',
     photos: ['Waikiki Beach', 'Oahu Sunset Beach', 'Oahu North Shore beach'],
   },
   {
@@ -27,7 +28,7 @@ export const DISCOVERY_SOURCES = [
   },
   {
     region: 'australia',
-    url: 'https://www.surfcoast.vic.gov.au/Experience/Beaches',
+    url: 'https://www.greatoceanroadauthority.vic.gov.au/Land-We-Manage/Coastal-Reserves/Bells-Beach',
     photos: ['Bells Beach Victoria', 'Snapper Rocks', 'Coolangatta Beach'],
   },
   {
@@ -37,6 +38,7 @@ export const DISCOVERY_SOURCES = [
   },
   {
     region: 'tahiti',
+    manualReview: 'robots_requires_manual_review',
     url: 'https://www.tahititourisme.com/equipment/teahupoo-tahiti-surfari/',
     photos: ['Teahupoo coast', 'Tahiti beach', 'Tahiti peninsula coast'],
   },

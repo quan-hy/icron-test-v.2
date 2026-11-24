@@ -44,8 +44,9 @@ export function officialMetadata(html: string, source: string) {
 
 export async function collectOfficial(url: string, fetcher: typeof fetch = fetch) {
   // Only the checked-in exact sources may initiate requests; discovered links are not crawled.
-  if (!DISCOVERY_SOURCES.some((source) => source.url === url))
-    throw new Error('source_not_allowed');
+  const source = DISCOVERY_SOURCES.find((item) => item.url === url);
+  if (!source) throw new Error('source_not_allowed');
+  if ('manualReview' in source) throw new Error(source.manualReview);
   const target = new URL(url);
   const robots = await researchFetch(new URL('/robots.txt', target), fetcher);
   if (robots.status !== 404) {
@@ -69,15 +70,21 @@ export async function collectCandidates(now = new Date(), fetcher: typeof fetch 
   for (const source of DISCOVERY_SOURCES) {
     const query = source.photos[week % source.photos.length]!;
     // Sequential, bounded source reads. No backoff loops, image downloads or community export.
-    const official = await collectOfficial(source.url, fetcher).then(
-      (data) => ({ status: 'collected' as const, data }),
-      (error: unknown) => ({
-        status: 'needs_attention' as const,
-        error: error instanceof Error ? error.message : 'source_failed',
-      }),
-    );
+    const official =
+      'manualReview' in source
+        ? { status: 'manual_review' as const, url: source.url, reason: source.manualReview }
+        : await collectOfficial(source.url, fetcher).then(
+            (data) => ({ status: 'collected' as const, data }),
+            (error: unknown) => ({
+              status: 'needs_attention' as const,
+              error: error instanceof Error ? error.message : 'source_failed',
+            }),
+          );
     const photos = await searchCommons(query, fetcher).then(
-      (data) => ({ status: 'collected' as const, data }),
+      (data) => ({
+        status: data.candidates.length ? ('collected' as const) : ('empty' as const),
+        data,
+      }),
       (error: unknown) => ({
         status: 'needs_attention' as const,
         error: error instanceof Error ? error.message : 'photos_failed',
@@ -86,7 +93,7 @@ export async function collectCandidates(now = new Date(), fetcher: typeof fetch 
     regions.push({ region: source.region, official, photos });
   }
   return {
-    schema: 1,
+    schema: 2,
     collectedAt: now.toISOString(),
     reviewStatus: 'pending' as const,
     approvedForPublication: false as const,
@@ -94,6 +101,54 @@ export async function collectCandidates(now = new Date(), fetcher: typeof fetch 
       'Research candidates only. Source titles and links are not verified travel advice. Photo location, attribution, license and depicted-person restrictions require human review. Never copy community posts into this artifact. No automatic publication.',
     regions,
   };
+}
+
+export function summarizeCandidates(report: Awaited<ReturnType<typeof collectCandidates>>) {
+  const { regions } = report;
+  const manual = regions.filter((r) => r.official.status === 'manual_review').length;
+  const official = regions.filter((r) => r.official.status === 'collected').length;
+  const photoChecks = regions.filter((r) => r.photos.status !== 'needs_attention').length;
+  const photoCount = regions.reduce(
+    (total, { photos }) =>
+      photos.status === 'needs_attention' ? total : total + photos.data.candidates.length,
+    0,
+  );
+  const failed = official === 0 || photoChecks === 0;
+  // Only display known diagnostic codes in Markdown. Raw diagnostics remain in the JSON artifact.
+  const diagnostic = (message: string) =>
+    /^[a-z_0-9]{1,64}$|^Commons HTTP \d{3}; no automatic retry\.$/.test(message)
+      ? message
+      : 'see candidates.json';
+  const rows = regions.map(({ region, official, photos }) => {
+    const page =
+      official.status === 'manual_review'
+        ? `[manual_review](${official.url}) (${official.reason})`
+        : official.status === 'needs_attention'
+          ? `needs_attention (${diagnostic(official.error)})`
+          : 'collected';
+    const photo =
+      photos.status === 'needs_attention'
+        ? `needs_attention (${diagnostic(photos.error)})`
+        : `${photos.status} (${photos.data.candidates.length})`;
+    return `| ${region} | ${page} | ${photo} |`;
+  });
+  const markdown = [
+    '# Weekly research candidates',
+    '',
+    `Collected: ${report.collectedAt}`,
+    '',
+    `Official pages collected: ${official} of ${regions.length - manual} automatic. Manual review: ${manual}.`,
+    `Photo candidates: ${photoCount}. Successful photo searches: ${photoChecks} of ${regions.length}.`,
+    ...(failed ? ['', 'Action required: an entire automatic source category is unavailable.'] : []),
+    '',
+    '| Region | Official page | Photo search (candidates) |',
+    '| --- | --- | --- |',
+    ...rows,
+    '',
+    'Pending human review. See candidates.json for source links and license details. Collection time is not a publication date or field check.',
+    '',
+  ].join('\n');
+  return { markdown, failed };
 }
 
 async function main() {
@@ -118,19 +173,10 @@ async function main() {
   await mkdir(directory, { recursive: true });
   const report = await collectCandidates();
   await writeFile(resolve(directory, 'candidates.json'), JSON.stringify(report, null, 2) + '\n');
-  const failures = report.regions.flatMap((region) =>
-    (['official', 'photos'] as const)
-      .filter((kind) => region[kind].status !== 'collected')
-      .map((kind) => `${region.region}/${kind}`),
-  );
-  await writeFile(
-    resolve(directory, 'README.md'),
-    `# Weekly research candidates\n\nCollected: ${report.collectedAt}\n\nPublication: pending human review; no runtime changes.\n\nRegions: ${report.regions.length}. Sources needing attention: ${failures.length}.\n\n${failures.map((item) => '- ' + item).join('\n')}\n\nRead candidates.json. A collection timestamp is not a source publication date or field check.\n`,
-  );
-  console.log(
-    `Candidate artifact written. ${report.regions.length} regions; ${failures.length} source failures. No publishing or image downloads.`,
-  );
-  if (failures.length) process.exitCode = 1;
+  const summary = summarizeCandidates(report);
+  await writeFile(resolve(directory, 'README.md'), summary.markdown);
+  console.log(summary.markdown);
+  if (summary.failed) process.exitCode = 1;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
